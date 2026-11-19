@@ -1186,10 +1186,15 @@ def plan_openai(sess: Session, text, model, base_url, max_steps=15, max_tokens=1
     tools = [{"type": "function", "function": {"name": t["name"], "description": t["description"],
                                                "parameters": t["input_schema"]}} for t in TOOLS]
     tool_names = {t["name"] for t in TOOLS}
-    msgs = [{"role": "system", "content": system_prompt(sess)}, {"role": "user", "content": text}]
+    # earlier turns of the same conversation (web app only; the benchmark sets none, so nothing changes there)
+    prior = list(getattr(sess, "prior_msgs", None) or [])
+    msgs = [{"role": "system", "content": system_prompt(sess)}] + prior + [{"role": "user", "content": text}]
     usage = dict(input_tokens=0, output_tokens=0, recovered_text_calls=0, nudges=0, truncated=0, deferred_submits=0)
     sess.usage = usage  # kept if a request fails, so the counters still reach the result file
     for _ in range(max_steps):
+        if getattr(sess, "stop_check", None) and sess.stop_check():   # web app: the user pressed Stop
+            usage["stopped"] = 1
+            break
         # max_tokens caps a reply: a small model can fall into a repetition loop and otherwise
         # generate until the context is full (minutes per question, then a 400 on the next request)
         r = client.chat.completions.create(model=model, messages=msgs, tools=tools, temperature=0,
@@ -1215,6 +1220,9 @@ def plan_openai(sess: Session, text, model, base_url, max_steps=15, max_tokens=1
             calls = [(n, a) for n, a in _calls_from_text(m.content) if n in tool_names]
             if not calls:
                 msgs.append({"role": "assistant", "content": m.content or ""})
+                usage["final_text"] = m.content or ""        # the web app can show a plain-text reply
+                if getattr(sess, "allow_text_reply", False) and (m.content or "").strip():
+                    break                                   # web chat: a plain-words answer is a valid reply
                 if sess.answer is None and not usage["nudges"]:
                     usage["nudges"] = 1
                     msgs.append({"role": "user", "content": "You have not called submit_answer yet. Continue using the tools and finish by calling submit_answer."})

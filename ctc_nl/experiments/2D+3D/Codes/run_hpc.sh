@@ -33,12 +33,11 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 ##SBATCH --mail-type=END,FAIL
-##SBATCH --mail-user=your_email@example.edu
 
 set -euo pipefail
 
 # ---------------------------------------------------------------- paths
-PROJECT=/mnt/projects/sutravek_project/Ali_belhrak/SI_Project
+PROJECT=${PROJECT:-$HOME/SI_Project}
 # 2D and 3D roots, separated by ':' (each dataset is found inside its root)
 export CTC_DATA=${CTC_DATA:-$PROJECT/CTC_Data/CTC_Data/2D:$PROJECT/CTC_Data/CTC_Data/3D}
 export CTC_OUT=${CTC_OUT:-$PROJECT/CTC_Data/Thesis}
@@ -101,7 +100,7 @@ setup() {   # LOGIN node: needs internet. Adds ONLY the missing packages to the 
   cat "$CTC_OUT/.venv_pins.txt"
   # extra packages for this pipeline; -c pins keep the existing Cellpose-SAM stack intact
   "$PIP" install -q -c "$CTC_OUT/.venv_pins.txt" timm scikit-learn tabulate openai \
-                 py-ctcmetrics huggingface_hub pillow fastapi uvicorn python-multipart
+                 py-ctcmetrics huggingface_hub pillow fastapi uvicorn python-multipart imageio imageio-ffmpeg shap
   # pre-download ViT weights so compute nodes need no internet (cpsam weights already exist).
   # HF_HUB_OFFLINE may be set in your shell; lift it only for this download.
   env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE -u HF_DATASETS_OFFLINE "$VENV/bin/python" - <<'PYEOF' \
@@ -327,9 +326,25 @@ WEB_PORT=${WEB_PORT:-$((8900 + ${SLURM_JOB_ID:-0} % 90))}
 # second cell finder offered on the upload page (default when present): the model fine-tuned with QPI
 QPI_MODEL_DEFAULT=$PROJECT/Quantitative-Phase_data/CelloSyncra/out/models/cpsam/models/cpsam_ft_joint_qpi
 WEB_SEG_MODEL_QPI=${WEB_SEG_MODEL_QPI-$( [ -f "$QPI_MODEL_DEFAULT" ] && echo "$QPI_MODEL_DEFAULT" )}
+NUCLEI_MODEL_DEFAULT=$PROJECT/ALFIdatasetFinal/CelloSyncra/out/models/cpsam/models/cpsam_alfi_nuclei   # "Nuclei - DIC" layer
+WEB_SEG_MODEL_NUCLEI=${WEB_SEG_MODEL_NUCLEI-$( [ -f "$NUCLEI_MODEL_DEFAULT" ] && echo "$NUCLEI_MODEL_DEFAULT" )}
+STATES_MODEL_DEFAULT=$PROJECT/CellState/out/train/v7/final/model.pkl   # cell states: dividing / signs of dying
+WEB_STATES_MODEL=${WEB_STATES_MODEL-$( [ -f "$STATES_MODEL_DEFAULT" ] && echo "$STATES_MODEL_DEFAULT" )}
 web() {
   "$VENV/bin/python" -c "import fastapi, uvicorn, multipart" 2>/dev/null \
     || { echo "ERROR: web packages missing - run on the login node: bash run_hpc.sh setup" >&2; exit 1; }
+  [ -f "$CODE_DIR/cs_tracks.py" ] || { echo "ERROR: cs_tracks.py missing: put it next to cellosyncra_web.py" >&2; exit 1; }
+  if [ -n "$WEB_STATES_MODEL" ]; then
+    export CELLSTATE_DIR=${CELLSTATE_DIR:-$PROJECT/CellState}      # the classifier code that trained the model
+    [ -f "$CODE_DIR/cs_states.py" ] || { echo "ERROR: cs_states.py missing: put it next to cellosyncra_web.py" >&2; exit 1; }
+    for f in cellstate_build.py cellstate_train.py; do
+      [ -f "$CELLSTATE_DIR/$f" ] || { echo "ERROR: $CELLSTATE_DIR/$f missing (cell states)" >&2; exit 1; }; done
+    "$VENV/bin/python" -c "import sklearn, pandas" 2>/dev/null \
+      || { echo "ERROR: scikit-learn missing in $VENV (cell states): $VENV/bin/pip install scikit-learn==<version used for training>" >&2; exit 1; }
+    [ -f "$CODE_DIR/cs_xai.py" ] || echo "WARNING: cs_xai.py missing next to cellosyncra_web.py: no SHAP / Grad-CAM++ explanations" >&2
+    "$VENV/bin/python" -c "import shap" 2>/dev/null \
+      || echo "WARNING: shap missing in $VENV: cell states work, but without SHAP explanations. On the login node: $VENV/bin/pip install shap" >&2
+  fi
   export QWEN_GPU_MEM=${QWEN_GPU_MEM:-0.75}               # leave GPU memory for Cellpose-SAM on uploads
   start_qwen
   mkdir -p "$WEB_WORK"
@@ -345,7 +360,8 @@ web() {
   echo "################################################################################"
   OPENAI_API_KEY=EMPTY "$VENV/bin/python" "$CODE_DIR/cellosyncra_web.py" --out "$WEB_OUT" --data "$CTC_DATA" \
       --work "$WEB_WORK" --backup "$BACKUP" --llm-url "$QWEN_URL" --llm-model "$OPEN_LLM" --port "$WEB_PORT" \
-      ${WEB_SEG_MODEL_QPI:+--model-qpi "$WEB_SEG_MODEL_QPI"}
+      ${WEB_SEG_MODEL_QPI:+--model-qpi "$WEB_SEG_MODEL_QPI"} ${WEB_SEG_MODEL_NUCLEI:+--model-nuclei "$WEB_SEG_MODEL_NUCLEI"} \
+      ${WEB_STATES_MODEL:+--model-states "$WEB_STATES_MODEL"}
 }
 
 # Static demo for GitHub Pages: replays the recorded Qwen answers on the test videos (no GPU needed).
